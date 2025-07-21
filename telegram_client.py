@@ -17,6 +17,28 @@ class TelegramService:
         
         if not self.api_id or not self.api_hash:
             raise ValueError("API_ID и API_HASH должны быть установлены в переменных окружения")
+        
+        # Восстанавливаем сессию из base64 если она есть (для облачного развертывания)
+        self._restore_session_from_env()
+    
+    def _restore_session_from_env(self):
+        """Восстанавливает файл сессии из переменной окружения SESSION_FILE_BASE64"""
+        session_base64 = os.getenv('SESSION_FILE_BASE64')
+        session_file_path = f"{self.session_name}.session"
+        
+        if session_base64 and not os.path.exists(session_file_path):
+            try:
+                import base64
+                session_data = base64.b64decode(session_base64)
+                with open(session_file_path, 'wb') as f:
+                    f.write(session_data)
+                print("✅ Сессия восстановлена из переменной окружения")
+            except Exception as e:
+                print(f"❌ Ошибка восстановления сессии: {e}")
+        elif os.path.exists(session_file_path):
+            print("ℹ️ Используется существующий файл сессии")
+        else:
+            print("ℹ️ Файл сессии не найден, потребуется авторизация")
     
     async def start_client(self):
         """Инициализация и подключение клиента Telegram"""
@@ -24,7 +46,31 @@ class TelegramService:
             self.client = TelegramClient(self.session_name, self.api_id, self.api_hash)
         
         if not self.client.is_connected():
-            await self.client.start()
+            try:
+                # Подключаемся без авторизации (только если сессия уже существует)
+                await self.client.connect()
+                
+                # Проверяем, авторизованы ли мы
+                if not await self.client.is_user_authorized():
+                    raise ValueError(
+                        "Сессия не найдена или недействительна. "
+                        "Для первоначальной настройки запустите приложение локально "
+                        "и пройдите авторизацию, затем загрузите файл сессии на Railway."
+                    )
+                
+            except Exception as e:
+                if "Сессия не найдена" in str(e):
+                    raise e
+                else:
+                    # Если возникла другая ошибка, пытаемся стандартную авторизацию
+                    # (это сработает только в локальной среде)
+                    try:
+                        await self.client.start()
+                    except EOFError:
+                        raise ValueError(
+                            "Невозможно выполнить интерактивную авторизацию в облачной среде. "
+                            "Пожалуйста, выполните авторизацию локально и загрузите файл сессии."
+                        )
         
         return self.client
     
