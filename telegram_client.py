@@ -29,10 +29,24 @@ class TelegramService:
         if session_base64 and not os.path.exists(session_file_path):
             try:
                 import base64
-                session_data = base64.b64decode(session_base64)
+                import gzip
+                
+                # Декодируем base64
+                compressed_data = base64.b64decode(session_base64)
+                
+                # Пытаемся распаковать (если данные сжаты)
+                try:
+                    session_data = gzip.decompress(compressed_data)
+                    print("✅ Сессия восстановлена из сжатой переменной окружения")
+                except gzip.BadGzipFile:
+                    # Если не получилось распаковать, значит данные не сжаты
+                    session_data = compressed_data
+                    print("✅ Сессия восстановлена из переменной окружения")
+                
+                # Записываем файл сессии
                 with open(session_file_path, 'wb') as f:
                     f.write(session_data)
-                print("✅ Сессия восстановлена из переменной окружения")
+                    
             except Exception as e:
                 print(f"❌ Ошибка восстановления сессии: {e}")
         elif os.path.exists(session_file_path):
