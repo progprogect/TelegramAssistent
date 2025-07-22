@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import uvicorn
+import time
 from telegram_client import telegram_service
 
 app = FastAPI(
@@ -24,6 +25,7 @@ class DialogResponse(BaseModel):
     name: str
     type: str
     unread_count: int
+    last_message_date: Optional[str] = None
 
 class MessageResponse(BaseModel):
     id: int
@@ -71,34 +73,57 @@ async def root():
     """Корневой эндпоинт с информацией о API"""
     return {
         "message": "Telegram API Gateway",
-        "version": "1.0.0",
+        "version": "1.1.0",
+        "features": [
+            "✅ Кеширование диалогов (TTL 10 мин)",
+            "⚡ Быстрые ответы из кеша",
+            "📊 Логирование производительности",
+            "🔄 Управление кешем"
+        ],
         "endpoints": {
-            "health": "GET /health - проверить статус сервиса и авторизации",
-            "init_session": "POST /init-session - инициализировать сессию (только локально)",
-            "dialogs": "GET /dialogs - получить список чатов",
+            "health": "GET /health - проверить статус сервиса и кеша",
+            "dialogs": "GET /dialogs?limit=50&force_refresh=false - получить список чатов",
+            "dialogs_refresh": "POST /dialogs/refresh - обновить кеш диалогов",
+            "cache_info": "GET /dialogs/cache/info - информация о кеше",
+            "cache_clear": "DELETE /dialogs/cache - очистить кеш",
             "messages": "GET /messages?chat_id=ID&limit=20 - получить сообщения",
             "send_message": "POST /sendMessage - отправить сообщение",
-            "join_chat": "POST /joinChat - вступить в чат"
+            "join_chat": "POST /joinChat - вступить в чат",
+            "init_session": "POST /init-session - инициализировать сессию (только локально)"
         },
         "docs": "/docs - интерактивная документация API"
     }
 
 @app.get("/dialogs", response_model=List[DialogResponse])
-async def get_dialogs():
+async def get_dialogs(
+    limit: int = Query(50, description="Количество диалогов для получения", ge=1, le=200),
+    force_refresh: bool = Query(False, description="Принудительно обновить кеш")
+):
     """
-    Получить список всех доступных чатов и каналов
+    Получить список доступных чатов и каналов с кешированием
+    
+    Параметры:
+    - limit: количество диалогов (по умолчанию 50, максимум 200)
+    - force_refresh: принудительно обновить кеш (по умолчанию false)
     
     Возвращает список диалогов с информацией о:
     - ID чата
-    - Названии
+    - Названии  
     - Типе (user/group/channel/supergroup)
     - Количестве непрочитанных сообщений
+    - Дате последнего сообщения
     """
+    start_time = time.time()
     await check_telegram_auth()
+    
     try:
-        dialogs = await telegram_service.get_dialogs()
+        dialogs = await telegram_service.get_dialogs(limit=limit, force_refresh=force_refresh)
+        duration = time.time() - start_time
+        print(f"📊 API /dialogs: {len(dialogs)} диалогов за {duration:.2f}с (limit={limit}, refresh={force_refresh})")
         return dialogs
     except Exception as e:
+        duration = time.time() - start_time
+        print(f"❌ API /dialogs ошибка за {duration:.2f}с: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Ошибка получения диалогов: {str(e)}")
 
 @app.get("/messages", response_model=List[MessageResponse])
@@ -113,13 +138,21 @@ async def get_messages(
     - chat_id: ID чата (обязательный)
     - limit: количество сообщений (по умолчанию 20, максимум 100)
     """
+    start_time = time.time()
     await check_telegram_auth()
+    
     try:
         messages = await telegram_service.get_messages(chat_id, limit)
+        duration = time.time() - start_time
+        print(f"📨 API /messages: {len(messages)} сообщений из чата {chat_id} за {duration:.2f}с")
         return messages
     except ValueError as e:
+        duration = time.time() - start_time
+        print(f"❌ API /messages ошибка 404 за {duration:.2f}с: {str(e)}")
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        duration = time.time() - start_time
+        print(f"❌ API /messages ошибка за {duration:.2f}с: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Ошибка получения сообщений: {str(e)}")
 
 @app.post("/sendMessage", response_model=StatusResponse)
@@ -194,17 +227,80 @@ async def init_session():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка инициализации сессии: {str(e)}")
 
+@app.post("/dialogs/refresh")
+async def refresh_dialogs_cache():
+    """
+    Принудительно обновить кеш диалогов
+    
+    Полезно для получения актуального списка чатов без ожидания истечения TTL
+    """
+    start_time = time.time()
+    await check_telegram_auth()
+    
+    try:
+        # Очищаем кеш и получаем свежие данные
+        telegram_service.clear_dialogs_cache()
+        dialogs = await telegram_service.get_dialogs(limit=200, force_refresh=True)
+        duration = time.time() - start_time
+        
+        cache_info = telegram_service.get_cache_info()
+        print(f"🔄 Кеш обновлен: {len(dialogs)} диалогов за {duration:.2f}с")
+        
+        return {
+            "status": "refreshed",
+            "message": f"Кеш обновлен, загружено {len(dialogs)} диалогов",
+            "duration_seconds": round(duration, 2),
+            "cache_info": cache_info
+        }
+    except Exception as e:
+        duration = time.time() - start_time
+        print(f"❌ Ошибка обновления кеша за {duration:.2f}с: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка обновления кеша: {str(e)}")
+
+@app.get("/dialogs/cache/info")
+async def get_cache_info():
+    """
+    Получить информацию о состоянии кеша диалогов
+    
+    Возвращает:
+    - Статус кеша (empty/active/expired)
+    - Количество диалогов в кеше
+    - Возраст кеша в секундах
+    - TTL кеша
+    """
+    cache_info = telegram_service.get_cache_info()
+    return {
+        "cache": cache_info,
+        "timestamp": time.time()
+    }
+
+@app.delete("/dialogs/cache")
+async def clear_cache():
+    """Очистить кеш диалогов"""
+    telegram_service.clear_dialogs_cache()
+    return {
+        "status": "cleared",
+        "message": "Кеш диалогов очищен"
+    }
+
 @app.get("/health")
 async def health_check():
     """Проверка состояния сервиса"""
+    start_time = time.time()
+    
     try:
         # Проверяем подключение к Telegram
         if telegram_service.client and telegram_service.client.is_connected():
             is_authorized = await telegram_service.client.is_user_authorized()
+            cache_info = telegram_service.get_cache_info()
+            duration = time.time() - start_time
+            
             return {
                 "status": "healthy", 
                 "telegram": "connected",
-                "authorized": is_authorized
+                "authorized": is_authorized,
+                "cache": cache_info,
+                "response_time_seconds": round(duration, 3)
             }
         else:
             return {

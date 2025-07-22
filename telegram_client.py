@@ -1,5 +1,6 @@
 import os
 import asyncio
+import time
 from typing import List, Dict, Any, Optional
 from telethon import TelegramClient, types, errors
 from telethon.tl.types import User, Chat, Channel
@@ -14,6 +15,11 @@ class TelegramService:
         self.api_hash = os.getenv('API_HASH')
         self.session_name = os.getenv('SESSION_NAME', 'telegram_session')
         self.client = None
+        
+        # Кеширование диалогов
+        self._dialogs_cache = None
+        self._dialogs_cache_time = 0
+        self._cache_ttl = 600  # 10 минут
         
         if not self.api_id or not self.api_hash:
             raise ValueError("API_ID и API_HASH должны быть установлены в переменных окружения")
@@ -93,14 +99,42 @@ class TelegramService:
         if self.client and self.client.is_connected():
             await self.client.disconnect()
     
-    async def get_dialogs(self) -> List[Dict[str, Any]]:
-        """Получить список всех диалогов (чатов, каналов, групп)"""
+    async def get_dialogs(self, limit: int = 50, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """
+        Получить список диалогов (чатов, каналов, групп) с кешированием
+        
+        Args:
+            limit: Максимальное количество диалогов (по умолчанию 50, максимум 200)
+            force_refresh: Принудительно обновить кеш
+        """
+        start_time = time.time()
+        
+        # Ограничиваем лимит
+        limit = min(max(limit, 1), 200)
+        
+        # Проверяем кеш
+        current_time = time.time()
+        if (not force_refresh and 
+            self._dialogs_cache is not None and 
+            current_time - self._dialogs_cache_time < self._cache_ttl):
+            
+            cached_result = self._dialogs_cache[:limit]
+            print(f"📋 Диалоги получены из кеша за {time.time() - start_time:.2f}с (лимит: {limit})")
+            return cached_result
+        
         await self.start_client()
         
+        print(f"🔄 Обновляем кеш диалогов...")
         dialogs = []
+        count = 0
+        
         async for dialog in self.client.iter_dialogs():
             entity = dialog.entity
             
+            # Пропускаем архивные диалоги без сообщений
+            if hasattr(dialog, 'archived') and dialog.archived:
+                continue
+                
             # Определяем тип чата
             if isinstance(entity, User):
                 chat_type = "user"
@@ -118,10 +152,43 @@ class TelegramService:
                 "id": entity.id,
                 "name": dialog.title or f"User {entity.id}",
                 "type": chat_type,
-                "unread_count": dialog.unread_count
+                "unread_count": dialog.unread_count,
+                "last_message_date": dialog.date.isoformat() if dialog.date else None
             })
+            
+            count += 1
+            # Ограничиваем загрузку для кеша (максимум 200)
+            if count >= 200:
+                break
         
-        return dialogs
+        # Сохраняем в кеш
+        self._dialogs_cache = dialogs
+        self._dialogs_cache_time = current_time
+        
+        result = dialogs[:limit]
+        duration = time.time() - start_time
+        print(f"✅ Загружено {len(dialogs)} диалогов в кеш за {duration:.2f}с (возвращено: {len(result)})")
+        
+        return result
+    
+    def clear_dialogs_cache(self):
+        """Очистить кеш диалогов"""
+        self._dialogs_cache = None
+        self._dialogs_cache_time = 0
+        print("🗑️ Кеш диалогов очищен")
+    
+    def get_cache_info(self) -> Dict[str, Any]:
+        """Получить информацию о состоянии кеша"""
+        if self._dialogs_cache is None:
+            return {"status": "empty", "dialogs_count": 0, "age_seconds": 0}
+        
+        age = time.time() - self._dialogs_cache_time
+        return {
+            "status": "active" if age < self._cache_ttl else "expired",
+            "dialogs_count": len(self._dialogs_cache),
+            "age_seconds": int(age),
+            "ttl_seconds": self._cache_ttl
+        }
     
     async def get_messages(self, chat_id: int, limit: int = 20) -> List[Dict[str, Any]]:
         """Получить сообщения из указанного чата"""
